@@ -1,0 +1,6 @@
+# PR瘦身 v1.0 依赖声明
+# ============================
+# 本工具仅使用 Python 3.10+ 标准库，无需安装任何第三方包。
+# 所需模块：os / shutil / xml / tkinter / datetime / pathlib / subprocess / gzip / threading / re / urllib
+#
+# 如果未来版本需要额外依赖，请在此处列出。
