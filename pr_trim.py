@@ -106,11 +106,13 @@ def send_to_recycle_bin(file_path: str) -> bool:
         else:
             return False
 
-        # 构建 PowerShell 命令：加载 VB 程序集后调用删除方法
+        # PowerShell 单引号字符串通过两个连续单引号表示字面单引号，
+        # 防止包含引号的合法文件名逃逸字符串并注入命令。
+        ps_path = str(file_path).replace("'", "''")
         ps_script = (
             f"Add-Type -AssemblyName Microsoft.VisualBasic; "
             f"[Microsoft.VisualBasic.FileIO.FileSystem]::{method}("
-            f"'{file_path}', 'OnlyErrorDialogue', 'SendToRecycleBin')"
+            f"'{ps_path}', 'OnlyErrorDialogue', 'SendToRecycleBin')"
         )
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script],
