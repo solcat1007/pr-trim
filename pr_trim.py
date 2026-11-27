@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PR瘦身 v1.0 — Premiere Pro 缓存清理与项目优化工具
+PR瘦身 v2.0 — Premiere Pro 缓存清理与项目优化工具
 =====================================================
 解决 Premiere Pro 在高端硬件（RTX 4070 + 32GB RAM）上仍然卡顿的痛点。
 根本原因：媒体缓存堆积、预览文件膨胀、项目碎片化。
@@ -11,22 +11,34 @@ PR瘦身 v1.0 — Premiere Pro 缓存清理与项目优化工具
   3. 大文件扫描 — 递归扫描项目文件夹，找出超大视频文件并可归档
   4. 一键优化 — 批量清理选中的缓存，保留最近 5 个自动保存
 
+v2.0 新增：安全的 dry-run 预览、跨平台回收站、详细报告（JSON/文本）、CLI 模式与彩蛋。
+
 依赖：仅使用 Python 标准库（os / shutil / xml / tkinter / datetime / pathlib / subprocess / gzip）。
 未使用任何第三方包，无需 pip install。
+更新：2026-11-27 (v2.0)
 """
 
+import argparse
+import json
 import os
 import re
 import shutil
 import gzip
+import sys
+import platform
 import xml.etree.ElementTree as ET
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 import subprocess
 import threading
+
+# v2.0：无图形环境时 CLI 仍可用
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+except ImportError:
+    tk = None
 
 
 # ============================================================================
@@ -91,34 +103,65 @@ def get_size_color(size_bytes: int) -> str:
         return COLOR_RED
 
 
+def detect_platform() -> str:
+    """v2.0：返回 'windows' / 'macos' / 'linux'，用于多平台分支"""
+    system = platform.system().lower()
+    if system == 'darwin':
+        return 'macos'
+    if system == 'windows':
+        return 'windows'
+    return 'linux'
+
+
 def send_to_recycle_bin(file_path: str) -> bool:
     """
-    通过 PowerShell 调用 .NET Framework 方法将文件/目录移入 Windows 回收站。
-    使用 Microsoft.VisualBasic.FileIO.FileSystem 提供可靠的回收站操作。
+    v2.0：跨平台将文件/目录移入回收站。
+      - Windows：PowerShell + Microsoft.VisualBasic.FileIO
+      - macOS：osascript 告知 Finder 删除
+      - Linux：gio trash / trash-put，均无则移动到 ~/.local/share/Trash/files
     返回 True 表示成功，False 表示失败。
     """
-    try:
-        # 判断路径类型，选择对应方法
-        if os.path.isfile(file_path):
-            method = "DeleteFile"
-        elif os.path.isdir(file_path):
-            method = "DeleteDirectory"
-        else:
-            return False
+    if not (os.path.isfile(file_path) or os.path.isdir(file_path)):
+        return False
+    current = detect_platform()
 
-        # 构建 PowerShell 命令：加载 VB 程序集后调用删除方法
-        ps_script = (
-            f"Add-Type -AssemblyName Microsoft.VisualBasic; "
-            f"[Microsoft.VisualBasic.FileIO.FileSystem]::{method}("
-            f"'{file_path}', 'OnlyErrorDialogue', 'SendToRecycleBin')"
-        )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return result.returncode == 0
+    try:
+        if current == 'windows':
+            method = "DeleteFile" if os.path.isfile(file_path) else "DeleteDirectory"
+            ps_script = (
+                f"Add-Type -AssemblyName Microsoft.VisualBasic; "
+                f"[Microsoft.VisualBasic.FileIO.FileSystem]::{method}("
+                f"'{file_path}', 'OnlyErrorDialogue', 'SendToRecycleBin')"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True, text=True, timeout=30)
+            return result.returncode == 0
+
+        if current == 'macos':
+            script = f'tell application "Finder" to delete POSIX file "{file_path}"'
+            result = subprocess.run(["osascript", "-e", script],
+                                    capture_output=True, text=True, timeout=30)
+            return result.returncode == 0
+
+        # Linux：优先使用标准 trash 命令
+        for cmd in (["gio", "trash", file_path], ["trash-put", file_path]):
+            if shutil.which(cmd[0]):
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    return True
+        # 兜底：移动到 XDG 回收站目录
+        trash_dir = Path(os.environ.get(
+            "XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "Trash" / "files"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        src = Path(file_path)
+        dest = trash_dir / src.name
+        counter = 1
+        while dest.exists():
+            dest = trash_dir / f"{src.name}.{counter}"
+            counter += 1
+        shutil.move(str(src), str(dest))
+        return True
     except Exception:
         return False
 
@@ -290,15 +333,209 @@ def estimate_project_complexity(prproj_path: Path) -> str:
 
 
 # ============================================================================
+# v2.0 新增：安全 dry-run / 清理计划 / 详细报告
+# ============================================================================
+
+# 绝不允许清理的路径片段（防止误删系统/用户目录）
+FORBIDDEN_PATH_PARTS = ('\\windows\\', '/windows/', '\\system32\\', '/system/',
+                        '\\program files\\', '/etc/', '/usr/', '/home/', '/root/')
+
+
+def is_safe_to_delete(path: Path, allowed_roots: list[Path] | None = None) -> tuple[bool, str]:
+    """
+    v2.0：删除前的安全校验，返回 (是否安全, 原因)。
+    规则：
+      1. 路径必须存在且是普通文件
+      2. 拒绝系统关键目录
+      3. 拒绝隐藏的符号链接（避免跟随链接删到别处）
+      4. 若提供 allowed_roots，路径必须位于其中之一
+    """
+    try:
+        path = Path(path).resolve()
+    except OSError as e:
+        return False, f"无法解析路径: {e}"
+    if not path.exists():
+        return False, "文件不存在"
+    if not path.is_file():
+        return False, "不是普通文件"
+    if path.is_symlink():
+        return False, "是符号链接，已跳过"
+    lowered = str(path).lower().replace('/', '\\')
+    if any(part.replace('/', '\\') in lowered for part in FORBIDDEN_PATH_PARTS):
+        return False, "位于系统关键目录，已跳过"
+    if allowed_roots:
+        roots = [r.resolve() for r in allowed_roots if r.exists()]
+        if roots and not any(str(path).lower().startswith(str(root).lower()) for root in roots):
+            return False, "不在允许的缓存目录内，已跳过"
+    return True, ""
+
+
+def build_cleanup_plan(scan_results: dict, categories: list[tuple],
+                       selected_keys: set[str] | None = None,
+                       keep_recent: int = 5) -> dict:
+    """
+    v2.0：根据缓存扫描结果构建清理计划（纯函数，不删除任何文件）。
+    返回 dict：{key: {'files': [...], 'kept': [...], 'skipped': [...], 'size': int}}
+    """
+    plan = {}
+    for key, display_name, _ in categories:
+        if selected_keys is not None and key not in selected_keys:
+            continue
+        data = scan_results.get(key, {"files": [], "size": 0})
+        files = list(data.get("files", []))
+        entry = {'name': display_name, 'files': [], 'kept': [], 'skipped': [], 'size': 0}
+
+        if key == 'auto_save' and keep_recent > 0:
+            files.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0, reverse=True)
+            entry['kept'] = files[:keep_recent]
+            candidates = files[keep_recent:]
+        else:
+            candidates = files
+
+        for f in candidates:
+            safe, reason = is_safe_to_delete(f)
+            if safe:
+                entry['files'].append(f)
+                try:
+                    entry['size'] += f.stat().st_size
+                except OSError:
+                    pass
+            else:
+                entry['skipped'].append({'path': str(f), 'reason': reason})
+        plan[key] = entry
+    return plan
+
+
+def plan_summary(plan: dict) -> tuple[int, int]:
+    """统计清理计划的文件数与总字节数"""
+    count = sum(len(e['files']) for e in plan.values())
+    size = sum(e['size'] for e in plan.values())
+    return count, size
+
+
+def format_cleanup_plan(plan: dict, dry_run: bool = True) -> str:
+    """v2.0：生成人类可读的清理计划文本（dry-run 与确认框共用）"""
+    count, size = plan_summary(plan)
+    title = "===== 干跑预览（未删除任何文件） =====" if dry_run else "===== 即将执行 ====="
+    lines = [title, ""]
+    for key, entry in plan.items():
+        lines.append(f"[{entry['name']}]")
+        lines.append(f"  待清理：{len(entry['files'])} 个（{format_size(entry['size'])}）")
+        if entry['kept']:
+            lines.append(f"  保留：{len(entry['kept'])} 个最新文件")
+        if entry['skipped']:
+            lines.append(f"  安全跳过：{len(entry['skipped'])} 个")
+            for item in entry['skipped'][:5]:
+                lines.append(f"    - {Path(item['path']).name}: {item['reason']}")
+        lines.append("")
+    lines.append(f"总计：{count} 个文件，约 {format_size(size)}")
+    if dry_run:
+        lines.append("提示：这是 dry-run 预览，磁盘未做任何更改。")
+    else:
+        lines.append("所有删除均移入回收站，可随时恢复。")
+    return '\n'.join(lines)
+
+
+def execute_cleanup_plan(plan: dict, dry_run: bool = True) -> dict:
+    """
+    v2.0：执行清理计划。dry_run=True 时只生成详细报告，绝不删除文件。
+    返回详细报告 dict，可导出 JSON 或显示到 GUI。
+    """
+    report = {
+        'tool': 'PRTrim', 'version': '2.0',
+        'generated_at': datetime.now().isoformat(timespec='seconds'),
+        'platform': detect_platform(),
+        'dry_run': dry_run,
+        'categories': [], 'deleted_files': 0, 'deleted_size': 0,
+        'failed': [], 'skipped': [],
+    }
+    for key, entry in plan.items():
+        cat = {'key': key, 'name': entry['name'], 'planned': len(entry['files']),
+               'planned_size': entry['size'], 'deleted': 0, 'failed': [], 'skipped': entry['skipped']}
+        report['skipped'].extend(entry['skipped'])
+        if not dry_run:
+            for f in entry['files']:
+                try:
+                    if send_to_recycle_bin(str(f)):
+                        cat['deleted'] += 1
+                        report['deleted_files'] += 1
+                        try:
+                            report['deleted_size'] += f.stat().st_size
+                        except OSError:
+                            pass
+                    else:
+                        cat['failed'].append(str(f))
+                        report['failed'].append(str(f))
+                except Exception as e:
+                    cat['failed'].append(f"{f}: {e}")
+                    report['failed'].append(f"{f}: {e}")
+        report['categories'].append(cat)
+    report['planned_files'], report['planned_size'] = plan_summary(plan)
+    return report
+
+
+def format_cleanup_report(report: dict) -> str:
+    """v2.0：格式化详细清理报告（供 GUI 与 CLI 复用）"""
+    mode = "干跑预览" if report['dry_run'] else "清理报告"
+    lines = [f"===== PR瘦身 v2.0 {mode} =====", ""]
+    lines.append(f"时间：{report['generated_at']}    平台：{report['platform']}")
+    lines.append(f"计划清理：{report['planned_files']} 个（{format_size(report['planned_size'])}）")
+    if not report['dry_run']:
+        lines.append(f"实际清理：{report['deleted_files']} 个（{format_size(report['deleted_size'])}）")
+    lines.append("")
+    for cat in report['categories']:
+        lines.append(f"[{cat['name']}] 计划 {cat['planned']} 个 / "
+                     f"{format_size(cat['planned_size'])}" +
+                     (f"，实际 {cat['deleted']} 个" if not report['dry_run'] else ""))
+        if cat['skipped']:
+            lines.append(f"  安全跳过 {len(cat['skipped'])} 个")
+        if cat['failed']:
+            lines.append(f"  失败 {len(cat['failed'])} 个")
+            for f in cat['failed'][:10]:
+                lines.append(f"    - {f}")
+    if report['dry_run']:
+        lines.append("\n本次为 dry-run，未对磁盘做任何更改。")
+    elif report['failed']:
+        lines.append(f"\n失败 {len(report['failed'])} 个，请检查上方的路径。")
+    else:
+        lines.append("\n全部完成！文件已移入回收站，可随时恢复。")
+    return '\n'.join(lines)
+
+
+def export_cleanup_report(report: dict, output_path: str) -> str:
+    """v2.0：导出详细报告为 JSON"""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    # Path 对象不可直接 JSON 序列化，统一转换为字符串
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+    return output_path
+
+
+def print_easter_egg():
+    """v2.0：--easter 隐藏彩蛋 —— SOLCAT ASCII 署名"""
+    art = r"""
+  ____             _   _       _   _
+ / ___|  ___  _ __| |_(_) __ _| |_| |__
+ \___ \ / _ \| '__| __| |/ _` | __| '_ \
+  ___) | (_) | |  | |_| | (_| | |_| | |
+ |____/ \___/|_|   \__|_|\__,_|\__|_| |_|
+"""
+    print(art)
+    print("  SOLCAT EASTER EGG PROTOCOL v2.0 — 你找到了隐藏入口")
+    print("  提示：↑↑↓↓←→←→BA · 连点标题 5 次 · 输入 solcat · Ctrl+Shift+T")
+    print("  清理彩蛋：保留最近 5 个自动保存——第 42 个才是真正的秘密 ;)")
+
+
+# ============================================================================
 # 主应用程序类
 # ============================================================================
 
 class PRTrimApp:
-    """PR瘦身 v1.0 主窗口应用程序"""
+    """PR瘦身 v2.0 主窗口应用程序"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("PR瘦身 v1.0")
+        self.root.title("PR瘦身 v2.0")
         self.root.geometry("540x540")
         self.root.resizable(False, False)
         self.root.configure(bg=COLOR_BG)
@@ -932,14 +1169,49 @@ class PRTrimApp:
         )
         self.btn_cleanup.pack(pady=(12, 4))
 
+        # v2.0：dry-run 与报告导出按钮
+        btn_row = tk.Frame(frame, bg=COLOR_CARD)
+        btn_row.pack(pady=(0, 4))
+        ttk.Button(btn_row, text="预览清理（dry-run）",
+                   command=self._on_dry_run).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="导出上次报告",
+                   command=self._on_export_report).pack(side=tk.LEFT)
+        self.last_report = None
+
         # 说明文字
         tk.Label(
             frame,
-            text="清理所有勾选的缓存文件，自动保存保留最近 5 个",
+            text="清理所有勾选的缓存文件，自动保存保留最近 5 个；支持跨平台回收站",
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
             font=("微软雅黑", 8),
         ).pack(pady=(0, 8))
+
+    def _on_dry_run(self):
+        """v2.0：安全的 dry-run —— 生成详细清理计划，绝不删除文件"""
+        if not self.cache_scan_results:
+            messagebox.showinfo("提示", "请先执行「扫描缓存」再进行预览")
+            return
+        selected = {key for key, _, _ in self.cache_categories
+                    if self.cache_checkbox_vars.get(key) and
+                    self.cache_checkbox_vars[key].get()}
+        plan = build_cleanup_plan(self.cache_scan_results, self.cache_categories,
+                                  selected_keys=selected)
+        text = format_cleanup_plan(plan, dry_run=True)
+        self.last_report = execute_cleanup_plan(plan, dry_run=True)
+        messagebox.showinfo("干跑预览（未删除任何文件）", text)
+
+    def _on_export_report(self):
+        """v2.0：导出最近一次报告为 JSON"""
+        if not self.last_report:
+            messagebox.showinfo("提示", "请先执行干跑预览或清理操作")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出详细报告", defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+        if path:
+            out = export_cleanup_report(self.last_report, path)
+            messagebox.showinfo("导出成功", f"报告已保存: {out}")
 
     def _on_cleanup(self):
         """一键清理：确认后执行清理并输出报告"""
@@ -1055,32 +1327,121 @@ class PRTrimApp:
         planned_files: int,
         planned_size: int,
     ):
-        """主线程：显示清理完成报告"""
+        """主线程：显示清理完成报告（v2.0：详细报告，可导出）"""
         self.btn_cleanup.configure(state="normal", text="一键优化")
-
-        lines = ["===== PR瘦身 v1.0 清理报告 =====", ""]
-        lines.append(f"已清理文件数：{deleted} 个")
-        lines.append(f"释放空间：{format_size(deleted_size)}")
-        lines.append(f"计划清理：{planned_files} 个文件（{format_size(planned_size)}）")
-        if failed:
-            lines.append(f"\n失败 {len(failed)} 个：")
-            for f_path in failed[:20]:  # 最多显示 20 个失败项
-                lines.append(f"  - {f_path}")
-            if len(failed) > 20:
-                lines.append(f"  ... 还有 {len(failed) - 20} 个")
+        report = {
+            'tool': 'PRTrim', 'version': '2.0',
+            'generated_at': datetime.now().isoformat(timespec='seconds'),
+            'platform': detect_platform(), 'dry_run': False,
+            'categories': [], 'planned_files': planned_files, 'planned_size': planned_size,
+            'deleted_files': deleted, 'deleted_size': deleted_size, 'failed': failed, 'skipped': [],
+        }
+        self.last_report = report
+        text = format_cleanup_report(report)
+        lines = [text]
+        if detect_platform() == 'windows':
+            lines.append("\n提示：如需恢复，请打开 Windows 回收站。")
+        elif detect_platform() == 'macos':
+            lines.append("\n提示：如需恢复，请打开 macOS 废纸篓。")
         else:
-            lines.append("\n全部清理成功！所有文件已移入回收站。")
-        lines.append("\n提示：如需恢复，请打开 Windows 回收站。")
-
-        messagebox.showinfo("清理报告", "\n".join(lines))
+            lines.append("\n提示：如需恢复，请查看回收站目录 ~/.local/share/Trash。")
+        messagebox.showinfo("清理报告", '\n'.join(lines))
 
 
 # ============================================================================
 # 程序入口
 # ============================================================================
 
+def build_parser():
+    """v2.0：构建命令行参数解析器"""
+    parser = argparse.ArgumentParser(
+        prog='pr_trim.py',
+        description='PR瘦身 v2.0 — Premiere Pro 缓存清理与项目优化（安全的 dry-run + 详细报告）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='示例:\n'
+               '  pr_trim.py --dry-run                # 只预览清理计划，不删除\n'
+               '  pr_trim.py --dry-run --report plan.json\n'
+               '  pr_trim.py --keep-recent 10 --report result.json\n'
+               '  pr_trim.py --easter\n'
+    )
+    parser.add_argument('--dry-run', action='store_true',
+                        help='安全预览：只生成清理计划与报告，不删除任何文件')
+    parser.add_argument('--keep-recent', type=int, default=5,
+                        help='自动保存保留最近 N 个（默认 5，0 表示全部清理）')
+    parser.add_argument('--report', dest='report_path', help='导出详细报告为 JSON')
+    parser.add_argument('--cache-root', action='append', default=[],
+                        help='自定义缓存根目录（可多次指定）')
+    parser.add_argument('--gui', action='store_true', help='启动图形界面')
+    parser.add_argument('--easter', action='store_true', help='隐藏彩蛋（嘘……）')
+    return parser
+
+
+def run_cli(argv=None):
+    """v2.0：命令行入口，返回退出码"""
+    args = build_parser().parse_args(argv)
+
+    if args.easter:
+        print_easter_egg()
+        return 0
+
+    if args.gui or (not any([args.dry_run, args.report_path, args.cache_root])):
+        if tk is None:
+            print("错误：当前环境无 tkinter，请使用 --dry-run 等命令行参数", file=sys.stderr)
+            return 2
+        main()
+        return 0
+
+    # 收集缓存目录：默认路径 + 自定义路径
+    cache_results = {}
+    categories = []
+    allowed_roots = [Path(p) for p in args.cache_root if p]
+    for name, resolvers in PR_CACHE_PATHS.items():
+        roots = []
+        for resolver in resolvers:
+            p = safe_path(resolver)
+            if p:
+                roots.append(p)
+        if not roots:
+            continue
+        all_files, total = [], 0
+        for root in roots:
+            files, size = scan_directory_recursive(root)
+            all_files.extend(files)
+            total += size
+        display = {'media_cache_db': '媒体缓存数据库', 'media_cache_files': '媒体缓存文件',
+                   'auto_save': '自动保存'}.get(name, name)
+        cache_results[name] = {'files': all_files, 'size': total}
+        categories.append((name, display, None))
+
+    # 自定义缓存根目录作为独立分类扫描，避免与默认目录重复计数
+    if allowed_roots:
+        all_files, total = [], 0
+        for root in allowed_roots:
+            files, size = scan_directory_recursive(root)
+            all_files.extend(files)
+            total += size
+        if all_files:
+            cache_results['custom'] = {'files': all_files, 'size': total}
+            categories.append(('custom', '自定义缓存目录', None))
+
+    if not cache_results:
+        print("未发现可清理的 PR 缓存目录（Windows 默认路径不存在）。"
+              "可用 --cache-root 指定目录。", file=sys.stderr)
+        return 1
+
+    plan = build_cleanup_plan(cache_results, categories,
+                              keep_recent=max(0, args.keep_recent))
+    print(format_cleanup_plan(plan, dry_run=True))
+    report = execute_cleanup_plan(plan, dry_run=True)
+
+    if args.report_path:
+        out = export_cleanup_report(report, args.report_path)
+        print(f"\n详细报告已导出: {out}")
+    return 0
+
+
 def main():
-    """启动 PR瘦身 v1.0 应用程序"""
+    """启动 PR瘦身 v2.0 应用程序"""
     root = tk.Tk()
     # 设置窗口图标（如果有的话）
     try:
@@ -1092,4 +1453,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run_cli())
